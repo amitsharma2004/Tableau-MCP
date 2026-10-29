@@ -1,0 +1,337 @@
+{
+  "version": "1.0",
+  "connection_id": "articles_sqlite",
+  "description": "Articles processing workflow database. Tracks the full lifecycle of scholarly articles from initial submission profiling through automated Nimble processing, IES human review, support task handling, GRC abort events, and final completion. Five tables: profiler (intake and eligibility gate), articles (lifecycle hub — all other tables join here), error_logs (pipeline failures), images_init (machine-extracted image baseline before review), images_update (human-reviewed image state plus MQC final quality verdict).",
+  "business_context": {
+    "domain": "Scholarly manuscript production — automated graphics and article processing pipeline.",
+    "lifecycle_order": [
+      "1. profiler: submission package is analysed; eligibility and routing are determined (next_process).",
+      "2. articles row is created; Nimble automated processing begins (nimble_start_time, nimble_status).",
+      "3. IES human review opens (review_start); reviewer accepts/corrects images; review closes (review_complete).",
+      "4. If issues arise, a support task is raised (support_task = 'open'); specialist resolves it (support_task = 'close').",
+      "5. If the article cannot continue in GRC, it is aborted (is_grc_abort = 1) with a documented reason.",
+      "6. Successful articles reach completion (is_completed = 1)."
+    ],
+    "key_business_rules": [
+      "An article is uniquely identified by the composite business key (jid, aid, revision). Multiple rows for the same (jid, aid) with different revisions are normal and expected.",
+      "is_completed = 1 means fully processed. Use is_completed != 1 OR is_completed IS NULL for in-progress articles — do NOT rely on is_completed = 0 alone.",
+      "Nimble is the automated processing engine. nimble_status: 'complete' = success, 'error' = job failed (check error_logs), 'pending' = still running.",
+      "support_task = 'open' means a support escalation is active. 'close' means it was resolved. NULL means no support task was ever raised.",
+      "is_grc_abort = 1 means the article was manually pulled from GRC automated processing. EXCLUDE these rows from throughput and completion rate metrics unless the question is specifically about aborted articles.",
+      "profiler.is_active = 1 MUST be applied to all profiler queries — inactive records are withdrawn submissions or superseded revisions.",
+      "profiler.next_process = 'imageextraction' is the GRC eligibility marker. Any other value means the article is ineligible or requires manual handling.",
+      "error_logs.article_id stores articles.aid (TEXT journal article ID), NOT articles.id (integer PK). Always join error_logs to articles on BOTH article_id = aid AND jid = jid.",
+      "images_init.is_accepted is TEXT ('1'/'0'). images_update.is_accepted is INTEGER (1/0). Never compare or UNION these columns without type-appropriate literals."
+    ]
+  },
+  "tables": {
+    "articles": {
+      "description": "Central lifecycle table. One row per article per revision per stage (PROOF = galley proof, EV = editorial verification, CE = copy editing). This is the hub table — images_init and images_update join via articles.id (integer PK); error_logs joins via articles.aid + articles.jid; profiler joins via articles.jid + articles.aid. Tracks every phase: Nimble automated processing, IES human review, support task escalation, GRC abort, and final completion. The natural business key is (jid, aid, revision).",
+      "business_context": "Use review_start and review_complete for IES review duration: (julianday(review_complete) - julianday(review_start)) * 1440 gives minutes in SQLite. Use support_start and support_complete for support task duration. nimble_status = 'complete' confirms Nimble finished successfully. is_grc_abort = 1 flags articles manually pulled from the pipeline — exclude from throughput metrics. stage, customer, and jid are the primary dimensions for segment analysis.",
+      "filter_defaults": {
+        "exclude_aborted": "WHERE is_grc_abort = 0 OR is_grc_abort IS NULL",
+        "completed_only": "WHERE is_completed = 1",
+        "in_progress": "WHERE (is_completed != 1 OR is_completed IS NULL) AND (is_grc_abort = 0 OR is_grc_abort IS NULL)",
+        "open_support": "WHERE support_task = 'open' AND support_complete IS NULL"
+      },
+      "sql_notes": [
+        "All timestamp columns are TEXT in ISO 8601 format. Use julianday(col) for duration arithmetic in SQLite.",
+        "is_completed: check = 1 for done; IS NULL or != 1 for in-progress. Do NOT rely on = 0 alone.",
+        "nimble_status and support_nimble_status are independent: nimble_status tracks the primary Nimble job; support_nimble_status tracks the Nimble rerun triggered after a support task.",
+        "review_user is TEXT (username string); support_user is INTEGER (user ID) — they reference different identity systems. Do not compare them directly.",
+        "stage values PROOF, EV, CE represent fundamentally different editorial contexts — always include stage in GROUP BY when comparing metrics across stages.",
+        "Always exclude is_grc_abort = 1 from completion rate, Nimble success rate, and review duration metrics unless the question is explicitly about aborted articles."
+      ],
+      "columns": {
+        "id": {"type": "INTEGER", "description": "Auto-increment integer primary key. This is the join key used by images_init.article_id and images_update.article_id. Do NOT confuse with articles.aid (the TEXT journal article ID used by error_logs.article_id)."},
+        "token": {"type": "TEXT", "description": "UUID token forming the IES review URL. A non-null token confirms a review link was generated and the article reached the IES review stage. NULL means the article has not yet entered human review — use token IS NOT NULL as a proxy for 'reached review'."},
+        "jid": {"type": "TEXT", "description": "Journal ID (e.g. TIS, ENDEND, PONE). Groups all articles belonging to the same journal. Part of the composite business key (jid, aid, revision). Always include jid when joining to error_logs or profiler to prevent cross-journal ID collisions where aid values repeat across journals."},
+        "aid": {"type": "TEXT", "description": "Journal article ID — unique within a journal but NOT globally unique. Stored as TEXT even when it looks numeric. Combined with jid it identifies an article across revisions. This is the value stored in error_logs.article_id — do NOT use articles.id for that join."},
+        "revision": {"type": "INTEGER", "description": "Submission revision number, starting at 1 and incrementing on resubmission. Use MAX(revision) per (jid, aid) in subqueries when you want only the latest state per article. Multiple revisions for the same article are common."},
+        "stage": {"type": "TEXT", "description": "Editorial processing stage. Known values: 'PROOF' (galley-proof stage, post-typesetting), 'EV' (editorial verification), 'CE' (copy editing). Workflows, completion criteria, and typical review durations differ by stage. Always include stage in GROUP BY for stage-level comparisons."},
+        "customer": {"type": "TEXT", "description": "Customer or publisher name (e.g. 'S&T'). Determines which workflow variant and QC rules apply. Include customer in GROUP BY for per-publisher metric comparisons."},
+        "manuscript": {"type": "TEXT", "description": "File system path to the primary manuscript PDF. Non-null for all valid submissions. NULL would indicate a data ingestion issue."},
+        "manuscript_doc": {"type": "TEXT", "description": "Path to the source .docx file. NULL for LaTeX or PDF-only submissions. Non-null confirms a Word-format submission — useful for format-mix analysis."},
+        "manuscript_latex_pdf": {"type": "TEXT", "description": "Path to the LaTeX-generated PDF. NULL for Word submissions. Non-null distinguishes LaTeX-sourced articles from Word-sourced ones."},
+        "manuscript_supporting_pdf": {"type": "TEXT", "description": "Path to supplementary material PDF. NULL if no supporting files were included with the submission."},
+        "manuscript_print_pdf": {"type": "TEXT", "description": "Path to the print-quality PDF variant used in downstream print production workflows."},
+        "manuscript_saveas_pdf": {"type": "TEXT", "description": "Path to a secondary save-as PDF export copy generated during processing."},
+        "is_completed": {"type": "INTEGER", "description": "1 if article processing is fully complete; 0 or NULL if still in progress. IMPORTANT: use is_completed = 1 for completion. For in-progress, use is_completed != 1 OR is_completed IS NULL — do NOT use is_completed = 0 alone. The completion_rate metric formula is: COUNT(CASE WHEN is_completed = 1 THEN 1 END) * 100.0 / COUNT(*)."},
+        "review_start": {"type": "TEXT", "description": "ISO 8601 timestamp when IES human review began. NULL means review has not started. Pair with review_complete for review duration: (julianday(review_complete) - julianday(review_start)) * 1440 gives minutes in SQLite."},
+        "nimble_start_time": {"type": "TEXT", "description": "ISO 8601 timestamp when the primary Nimble automated processing job was submitted. NULL means Nimble has not yet been invoked. Use with created_at to compute time-to-Nimble lag."},
+        "nimble_support_start_time": {"type": "TEXT", "description": "ISO 8601 timestamp when the secondary Nimble job triggered by a support task was submitted. Distinct from nimble_start_time — this is a reprocessing run after support corrections. NULL if no support Nimble job was triggered."},
+        "review_complete": {"type": "TEXT", "description": "ISO 8601 timestamp when IES review was completed. NULL means review is still open or has not started. Use with review_start to compute review duration. A non-null review_complete where is_completed = 0 means the article passed review but is still in a downstream step."},
+        "nimble_status": {"type": "TEXT", "description": "Status of the primary Nimble automated processing job. Known values: 'complete' (job finished successfully), 'error' (job failed — investigate via error_logs using UPPER(error_from) = 'NIMBLE'), 'pending' (job submitted but still running). NULL means Nimble has not been invoked. Use nimble_status = 'error' to find articles needing reprocessing."},
+        "support_task": {"type": "TEXT", "description": "Support task status. Known values: 'open' (support escalation is active — reviewer flagged an issue requiring specialist help), 'close' (support task resolved). NULL means no support task was ever raised. Use support_task = 'open' AND support_complete IS NULL to find currently blocked articles awaiting support."},
+        "support_start": {"type": "TEXT", "description": "ISO 8601 timestamp when the support task was opened. NULL if no support task was raised. Pair with support_complete for support duration: (julianday(support_complete) - julianday(support_start)) * 1440 gives minutes."},
+        "support_complete": {"type": "TEXT", "description": "ISO 8601 timestamp when the support task was resolved and closed. NULL if support is still active or was never raised. support_task = 'open' AND support_complete IS NULL identifies currently unresolved escalations."},
+        "support_nimble_status": {"type": "TEXT", "description": "Nimble job status for the support-triggered reprocessing run. Same vocabulary as nimble_status (complete / error / pending). NULL if no support Nimble job was triggered. Use to diagnose whether articles reprocessed successfully after support corrections."},
+        "support_remarks": {"type": "TEXT", "description": "Free-text notes entered by the support reviewer. NULL if no support task exists. Use LIKE filters to identify patterns in support escalation reasons (e.g. WHERE support_remarks LIKE '%colour%')."},
+        "review_user": {"type": "TEXT", "description": "Username string of the IES reviewer who reviewed this article. NULL if review has not started. Use for per-reviewer workload, speed, and throughput analysis. NOTE: TEXT username — different identity system from support_user (INTEGER ID)."},
+        "support_user": {"type": "INTEGER", "description": "Integer user ID of the support staff member who handled the support task. NULL if no support task. Different ID system from review_user (TEXT username) — do not join or compare these two columns directly."},
+        "disclaimer": {"type": "TEXT", "description": "Disclaimer text attached to the article, if any. NULL in most cases. Informational only — not used in any metric calculations."},
+        "mmc_count": {"type": "INTEGER", "description": "Count of multimedia content (MMC) items (video, audio, supplementary data) attached to the article. 0 or NULL means no multimedia. Use mmc_count > 0 to identify articles with multimedia, which require additional processing steps."},
+        "template": {"type": "TEXT", "description": "Processing template applied to this article, determining layout rules and sizing specifications. NULL means a default template was used. Group by template to compare processing outcomes across template types."},
+        "size_preview_approved": {"type": "INTEGER", "description": "1 if the size preview approval step was completed; 0 or NULL if pending or not applicable. A 0 value while is_completed = 0 may indicate the article is waiting on size approval before proceeding."},
+        "mmc_upload_status": {"type": "INTEGER", "description": "1 if the multimedia content upload succeeded; 0 or NULL if not uploaded or failed. Only meaningful when mmc_count > 0. mmc_count > 0 AND mmc_upload_status != 1 flags incomplete MMC uploads."},
+        "is_grc_abort": {"type": "INTEGER", "description": "1 if the article was manually aborted from GRC automated processing; 0 or NULL otherwise. An abort means the article was pulled from the pipeline and typically routed to manual handling. ALWAYS EXCLUDE is_grc_abort = 1 from completion rate, review duration, and Nimble success metrics unless the question explicitly asks about aborted articles. Use grc_abort_category to analyse abort patterns."},
+        "grc_abort_reason": {"type": "TEXT", "description": "Human-readable reason why the article was aborted (e.g. 'Content not suitable for automated processing'). NULL when is_grc_abort = 0. Apply GROUP BY grc_abort_reason (after filtering is_grc_abort = 1) to identify the most frequent abort causes."},
+        "grc_abort_category": {"type": "TEXT", "description": "Categorical classification of the abort reason (e.g. 'content_issue', 'format_issue', 'customer_request'). NULL when is_grc_abort = 0. Enables higher-level abort analysis without parsing free text. Always filter is_grc_abort = 1 before grouping on this column."},
+        "grc_abort_remarks": {"type": "TEXT", "description": "Additional operational notes on the GRC abort decision. NULL when is_grc_abort = 0. Supplements grc_abort_reason with detail for complex abort cases."},
+        "sizing_spec": {"type": "TEXT", "description": "Sizing specification applied to this article (e.g. publisher-specific image sizing rules). Determines image resizing parameters during Nimble processing. NULL if not yet applied or not applicable."},
+        "created_at": {"type": "TEXT", "description": "ISO 8601 timestamp when this article row was first created — i.e. when the article was received and ingested. Use as the primary date filter for time-windowed queries (e.g. 'articles received last month': WHERE created_at >= '2025-09-01' AND created_at < '2025-10-01')."},
+        "updated_at": {"type": "TEXT", "description": "ISO 8601 timestamp of the last update to this row. Use for detecting recently modified articles or computing time since last activity."}
+      },
+      "primary_key": "id",
+      "business_keys": ["jid", "aid", "revision"]
+    },
+    "error_logs": {
+      "description": "Pipeline error log. One row per error event per article. Records failures during automated processing steps, identifying the originating step (error_from) and the blocked downstream step (error_to). An article can have multiple error rows across processing attempts. Use COUNT(*) for total error volume and COUNT(DISTINCT article_id || '|' || jid) for distinct affected articles. An article appearing in error_logs is not necessarily permanently failed — it may have recovered and completed.",
+      "business_context": "error_from identifies where processing broke down (e.g. IMAGEEXTRACTION = the image extraction tool failed; NIMBLE = the automated processing engine failed). error_to identifies the next step that could not be reached. The error_from → error_to transition defines the failure boundary. error_description contains the raw error message for diagnostic detail. Join to articles.is_completed to separate articles that eventually recovered from those that remain stuck.",
+      "sql_notes": [
+        "CRITICAL: error_logs.article_id is TEXT and stores articles.aid (journal article ID), NOT articles.id (integer PK). The column name 'article_id' is misleading.",
+        "ALWAYS join on BOTH conditions: error_logs.article_id = articles.aid AND error_logs.jid = articles.jid. A single-column join on article_id alone causes cross-journal false matches.",
+        "To count distinct articles with errors: COUNT(DISTINCT error_logs.article_id || '|' || error_logs.jid) or use a correlated subquery.",
+        "error_from and error_to are free-text step names, typically uppercase. Normalise with UPPER() or LOWER() before grouping.",
+        "To find Nimble-specific errors: WHERE UPPER(error_from) = 'NIMBLE' or WHERE UPPER(error_from) LIKE '%NIMBLE%'."
+      ],
+      "columns": {
+        "id": {"type": "INTEGER", "description": "Auto-increment primary key for the error log row."},
+        "article_id": {"type": "TEXT", "description": "Stores articles.aid (journal article TEXT ID), NOT the integer articles.id. The column name is misleading. Join to articles using: error_logs.article_id = articles.aid AND error_logs.jid = articles.jid. Never join error_logs.article_id = articles.id."},
+        "jid": {"type": "TEXT", "description": "Journal ID. Required in every join to articles to prevent cross-journal ID collisions. Matches articles.jid."},
+        "revision": {"type": "INTEGER", "description": "Revision number of the article when the error occurred. Include in joins when revision-level accuracy is required."},
+        "stage": {"type": "TEXT", "description": "Editorial stage (PROOF, EV, CE) at which the error occurred. Use to compare error rates across stages."},
+        "customer": {"type": "TEXT", "description": "Customer/publisher at the time of the error. Use for per-customer pipeline reliability analysis."},
+        "error_from": {"type": "TEXT", "description": "Pipeline step where processing broke down. Common values: IMAGEEXTRACTION, NIMBLE, GRAPHICSNORMALIZATION, PROFILER. Group by error_from to identify which steps fail most frequently."},
+        "error_to": {"type": "TEXT", "description": "The downstream pipeline step that was blocked by the error — the step that could not start. Together with error_from, defines the error transition boundary (e.g. IMAGEEXTRACTION → GRAPHICSNORMALIZATION)."},
+        "error_description": {"type": "TEXT", "description": "Raw error message text from the failing pipeline step. Use for diagnostic detail. Apply LIKE patterns for keyword searches (e.g. WHERE error_description LIKE '%timeout%'). Not suitable for direct grouping without normalisation."},
+        "created_at": {"type": "TEXT", "description": "ISO 8601 timestamp when the error was logged. Use for error trend analysis over time."}
+      },
+      "primary_key": "id",
+      "relationships": {
+        "articles": {
+          "join_type": "LEFT",
+          "cardinality": "many_to_one",
+          "keys": [
+            {"local": "article_id", "foreign": "aid"},
+            {"local": "jid", "foreign": "jid"}
+          ],
+          "join_strategy": "Always join on BOTH: error_logs.article_id = articles.aid AND error_logs.jid = articles.jid. A single-key join on article_id alone produces incorrect results because aid values are not globally unique across journals. error_logs.article_id stores articles.aid (TEXT), never articles.id (INTEGER).",
+          "note": "Join on both article_id = aid AND jid = jid for correctness."
+        }
+      }
+    },
+    "images_init": {
+      "description": "Machine-extracted image baseline. One row per image per article, captured when the submission first enters the processing pipeline before any human review. This is the automated-output baseline — what the extraction tool produced. Compare with images_update (the post-review state) to measure extraction accuracy, reviewer intervention rate, and image quality drift.",
+      "business_context": "This is the 'before human touch' snapshot. The IES reviewer may later accept, reject, rename, reorder, or replace these images — those decisions land in images_update. The delta between images_init and images_update is the most direct measure of extraction accuracy. is_accepted reflects the reviewer's decision written back to the init record after review.",
+      "sql_notes": [
+        "article_id references articles.id (integer auto-increment PK). This is the correct integer FK join. Do NOT confuse with articles.aid.",
+        "is_accepted is TEXT — always compare with quoted string literals: is_accepted = '1' (accepted), is_accepted = '0' (rejected). An unquoted integer comparison may produce unexpected results.",
+        "height is stored as TEXT despite representing a numeric dimension. Cast before arithmetic: CAST(height AS REAL).",
+        "Join images_init to images_update on image_id to get the before/after pair for drift analysis.",
+        "colour_input values include 'RGB', 'CMYK', 'Grayscale', 'Bitmap'. Use UPPER() or LOWER() before grouping."
+      ],
+      "columns": {
+        "id": {"type": "INTEGER", "description": "Auto-increment primary key for this image row."},
+        "article_id": {"type": "INTEGER", "description": "References articles.id (integer sequential PK). This is the correct join key to articles. Do NOT confuse with articles.aid (the TEXT journal article ID used by error_logs)."},
+        "image_id": {"type": "TEXT", "description": "Unique image identifier within the article. The join key between images_init and images_update — one image_id maps to at most one init row and one update row. Use for before/after drift analysis."},
+        "label": {"type": "TEXT", "description": "Figure label as it appears in the manuscript (e.g. 'Fig. 1', 'Figure 2a'). NULL if no label was detected during extraction."},
+        "image_name": {"type": "TEXT", "description": "Original file name of the extracted image. May differ from images_update.image_name if the reviewer renamed it — compare to detect renames."},
+        "image_path": {"type": "TEXT", "description": "File system storage path of the extracted image file. NULL if extraction failed. Non-null confirms the image was successfully written to storage."},
+        "save_as_path": {"type": "TEXT", "description": "File system path for the save-as export variant. NULL if not yet generated."},
+        "image_order": {"type": "INTEGER", "description": "Numeric sequence position of the image within the article (1 = first). Compare with images_update.image_order to detect reviewer-corrected ordering."},
+        "image_order_alpha": {"type": "TEXT", "description": "Alphabetic sub-label for panels within a multi-part figure (e.g. 'a', 'b', 'c'). NULL for single-panel figures."},
+        "font_size": {"type": "REAL", "description": "Font size detected within the image in points. Used for automated sizing decisions. NULL if font detection produced no result."},
+        "image_size": {"type": "REAL", "description": "File size of the image in bytes. Use to identify oversized images that may need compression."},
+        "size": {"type": "TEXT", "description": "Column/page size classification applied to the image (e.g. 'single', 'double', 'full_page') based on the sizing specification."},
+        "width": {"type": "REAL", "description": "Image width in points. NULL if dimensions were not extracted."},
+        "height": {"type": "TEXT", "description": "Image height in points stored as TEXT. Cast to REAL before arithmetic: CAST(height AS REAL). NULL if dimensions were not extracted."},
+        "colour_input": {"type": "TEXT", "description": "Input colour mode of the image. Common values: 'RGB' (web colour), 'CMYK' (print colour), 'Grayscale', 'Bitmap'. Use UPPER() or LOWER() before grouping to normalise case variants."},
+        "is_accepted": {"type": "TEXT", "description": "Reviewer acceptance status stored as TEXT. Compare with quoted literals only: '1' = accepted, '0' = rejected, NULL = not yet reviewed. Never compare with unquoted integers — the comparison may silently fail."},
+        "rejection_category": {"type": "TEXT", "description": "Categorical reason for image rejection (e.g. 'low_resolution', 'wrong_colour_mode'). NULL if accepted or not yet reviewed. Group by rejection_category to find the most common extraction failure modes."},
+        "rejection_reason": {"type": "TEXT", "description": "Detailed free-text explanation of the rejection. NULL if accepted or pending review. Supplements rejection_category with specifics."},
+        "is_rasterize": {"type": "INTEGER", "description": "1 if the image was rasterized during extraction (vector content converted to pixels); 0 or NULL otherwise. A high rasterize rate may indicate quality loss in figures that were originally vector graphics."},
+        "is_landscape": {"type": "INTEGER", "description": "1 if the image is in landscape orientation (wider than tall); 0 or NULL for portrait. Landscape images often require special layout handling."},
+        "created_at": {"type": "TEXT", "description": "ISO 8601 timestamp when this image row was created — i.e. when extraction ran for this article."},
+        "updated_at": {"type": "TEXT", "description": "ISO 8601 timestamp of the last update to this row."}
+      },
+      "primary_key": "id",
+      "relationships": {
+        "articles": {
+          "join_type": "LEFT",
+          "cardinality": "many_to_one",
+          "keys": [{"local": "article_id", "foreign": "id"}],
+          "join_strategy": "Join on images_init.article_id = articles.id (integer PK). This is a clean declared FK join — no composite key needed."
+        }
+      }
+    },
+    "images_update": {
+      "description": "Post-review image state written by the IES reviewer and, for applicable customers, the MQC (Manual Quality Check) reviewer. One row per image per article. Mirrors images_init structure but reflects the human-approved final state. Adds mqc_is_accepted and mqc_description for the final quality-check gate. This is the authoritative record of what images the article will be published with.",
+      "business_context": "This is the 'after human touch' state. is_accepted (INTEGER) reflects the IES reviewer's final decision on each image. mqc_is_accepted reflects the MQC reviewer's verdict — applicable only to customers with a Manual QC step. mqc_is_accepted IS NULL for customers without MQC or for images not yet QC'd — always filter IS NOT NULL before aggregating MQC metrics. is_support_image_replaced = 1 flags images replaced by the specialist support team rather than the primary reviewer, indicating a higher-severity quality issue.",
+      "sql_notes": [
+        "is_accepted is INTEGER here (1 = accepted, 0 = rejected). This DIFFERS from images_init.is_accepted which is TEXT. Never directly compare or UNION is_accepted across these two tables.",
+        "mqc_is_accepted is TEXT. Verify stored values before filtering — they may be '1'/'0', 'true'/'false', or 'yes'/'no' depending on the application version. Filter IS NOT NULL before computing MQC acceptance rate.",
+        "article_id references articles.id (integer PK) — same join as images_init.",
+        "Join to images_init on image_id to compare before/after states and compute extraction accuracy metrics."
+      ],
+      "columns": {
+        "id": {"type": "INTEGER", "description": "Auto-increment primary key for this image update row."},
+        "article_id": {"type": "INTEGER", "description": "References articles.id (integer sequential PK). Same join key as images_init.article_id. Do NOT use articles.aid."},
+        "image_id": {"type": "TEXT", "description": "Unique image identifier within the article. Join key to images_init.image_id for before/after comparison. One image_id has at most one init row and one update row."},
+        "label": {"type": "TEXT", "description": "Figure label as confirmed or corrected by the IES reviewer. May differ from images_init.label if the reviewer changed it."},
+        "image_name": {"type": "TEXT", "description": "File name of the image in its post-review state. Compare with images_init.image_name to detect reviewer renames."},
+        "is_accepted": {"type": "INTEGER", "description": "IES reviewer acceptance decision. INTEGER: 1 = accepted, 0 = rejected. CRITICAL: this is INTEGER, unlike images_init.is_accepted which is TEXT. Use is_accepted = 1 (unquoted) here; use is_accepted = '1' (quoted) in images_init queries."},
+        "mqc_is_accepted": {"type": "TEXT", "description": "MQC (Manual Quality Check) reviewer final verdict. NULL if MQC does not apply to this customer or if MQC review has not yet occurred. Always filter IS NOT NULL before computing MQC acceptance rates. Pair with mqc_description to understand rejection detail."},
+        "mqc_description": {"type": "TEXT", "description": "MQC reviewer notes or rejection reason. NULL for accepted images or where MQC has not occurred. Group by mqc_description or apply LIKE patterns to identify common QC failure types (e.g. WHERE mqc_description LIKE '%resolution%')."},
+        "is_support_image_replaced": {"type": "INTEGER", "description": "1 if the specialist support team replaced this image; 0 or NULL otherwise. Support replacements indicate images requiring intervention beyond normal reviewer capability — a higher-severity quality signal. Compute support replacement rate as: SUM(is_support_image_replaced) * 100.0 / COUNT(*)."},
+        "created_at": {"type": "TEXT", "description": "ISO 8601 timestamp when this update row was created — i.e. when IES review of this image began."},
+        "updated_at": {"type": "TEXT", "description": "ISO 8601 timestamp of the last update, reflecting the most recent change by the IES or MQC reviewer."}
+      },
+      "primary_key": "id",
+      "relationships": {
+        "articles": {
+          "join_type": "LEFT",
+          "cardinality": "many_to_one",
+          "keys": [{"local": "article_id", "foreign": "id"}],
+          "join_strategy": "Join on images_update.article_id = articles.id (integer PK). Clean FK join — no composite key needed."
+        }
+      },
+      "caveats": [
+        "images_update.is_accepted is INTEGER (1/0); images_init.is_accepted is TEXT ('1'/'0'). Do not compare, UNION, or apply the same filter literal to both tables without adjustment.",
+        "mqc_is_accepted is TEXT and may be NULL for non-MQC customers. Always check IS NOT NULL before aggregating MQC metrics.",
+        "This table only contains rows for articles that have reached IES review. An article absent from images_update has not yet been reviewed — it is NOT a rejection."
+      ]
+    },
+    "profiler": {
+      "description": "Article intake and eligibility gatekeeper. One row per submission, created when the submission package is first analysed by the profiler tool — before any automated processing or human review. Determines GRC eligibility via next_process: 'imageextraction' = eligible for automated pipeline; any other value = ineligible or manually routed. The profiler decision is the entry point of the entire workflow.",
+      "business_context": "next_process = 'imageextraction' (case-insensitive) is the single GRC eligibility marker. Articles that fail eligibility (double_column layout, non-Word format, profiler error) never generate an articles row or images — they are routed manually or rejected. is_active = 1 must be applied to all profiler queries — inactive rows are withdrawn submissions or superseded revisions and inflate all counts if included. The join between profiler and articles has NO declared FK: bridge on (jid, aid) as an assumed business-key join.",
+      "filter_defaults": {
+        "active_only": "WHERE is_active = 1",
+        "eligible_for_grc": "WHERE is_active = 1 AND LOWER(next_process) = 'imageextraction'",
+        "ineligible": "WHERE is_active = 1 AND (LOWER(next_process) != 'imageextraction' OR next_process IS NULL)",
+        "profiler_errors": "WHERE is_active = 1 AND LOWER(status) = 'error'"
+      },
+      "sql_notes": [
+        "is_active = 1 MUST be applied to virtually every profiler query. Omitting it inflates all counts with withdrawn and superseded records.",
+        "next_process is the eligibility gate. Use LOWER(next_process) = 'imageextraction' for safe case-insensitive comparison.",
+        "submission_type: 'single_column' = eligible; 'double_column' = out of scope for automated processing.",
+        "status: 'completed' means the profiler tool ran successfully and next_process is reliable. 'error' means the profiler failed — next_process may be NULL or unreliable; check remarks.",
+        "Join to articles: profiler.jid = articles.jid AND profiler.aid = articles.aid. There is NO declared FK — this is an assumed business-key join. Add profiler.revision = articles.revision for revision-level accuracy.",
+        "profiler.id is NOT related to articles.id — they are independent sequences. Do not use profiler.id to join to image tables."
+      ],
+      "columns": {
+        "id": {"type": "INTEGER", "description": "Auto-increment primary key for the profiler row. Not related to articles.id — independent sequence. Do not use profiler.id to join to image tables."},
+        "jid": {"type": "TEXT", "description": "Journal ID. Part of the composite business key (jid, aid) used to join profiler to articles. Matches articles.jid. Required in the join to avoid cross-journal ID collisions."},
+        "aid": {"type": "TEXT", "description": "Article ID within the journal. Part of the composite business key. Matches articles.aid. Together with jid, uniquely identifies an article across revisions."},
+        "customer": {"type": "TEXT", "description": "Customer/publisher. Matches articles.customer. Use for per-customer eligibility rate and profiler error rate slicing."},
+        "revision": {"type": "INTEGER", "description": "Submission revision number. Include in joins to articles when revision-level accuracy is needed. Use MAX(revision) per (jid, aid, customer) to get the latest profiler record per article."},
+        "file_info": {"type": "TEXT", "description": "Summary string describing file types and counts in the submission package (e.g. 'xml(2), docx(8)'). Free-text — use LIKE patterns to search for specific file types. Useful for diagnosing non-standard submission compositions."},
+        "extension": {"type": "TEXT", "description": "Primary file extension of the submission (e.g. '.docx', '.doc', '.tex'). Eligibility typically requires '.doc' or '.docx'. Use LOWER(extension) IN ('.doc', '.docx') for the format eligibility filter."},
+        "submission_type": {"type": "TEXT", "description": "Column layout classification. Known values: 'single_column' (eligible for GRC automated processing), 'double_column' (ineligible — out of scope). Use LOWER(submission_type) for safe comparison. This is the primary layout-based eligibility criterion alongside extension."},
+        "remarks": {"type": "TEXT", "description": "Free-text notes from the profiler tool, including error messages when status = 'error'. Use LIKE patterns for keyword searches on failure modes. NULL for clean, unremarkable profiler runs."},
+        "next_process": {"type": "TEXT", "description": "Pipeline routing decision. The GRC eligibility marker is LOWER(next_process) = 'imageextraction'. Other values (e.g. 'manual', 'reject') or NULL indicate the article is ineligible, has an error, or requires non-standard routing. This is the single most important column for eligibility_rate computation."},
+        "application": {"type": "TEXT", "description": "Authoring application detected from submission file metadata (e.g. 'Microsoft Office Word', 'LaTeX'). NULL if detection failed. Use for understanding submission format mix and diagnosing application-specific extraction issues."},
+        "app_version": {"type": "REAL", "description": "Version number of the authoring application (e.g. 16.0 for Word 2016). NULL if not detected. Combine with application for version-specific failure analysis."},
+        "status": {"type": "TEXT", "description": "Profiler tool execution status. Known values: 'completed' (tool ran successfully; next_process is reliable), 'error' (tool failed; next_process may be NULL or unreliable — check remarks). Only use 'completed' rows when computing eligibility metrics."},
+        "is_active": {"type": "INTEGER", "description": "1 = active/current profiler record; 0 = inactive (withdrawn, superseded, or test data). ALWAYS filter is_active = 1 unless the question explicitly asks about inactive records. Omitting this filter inflates all counts and rates."},
+        "created_at": {"type": "TEXT", "description": "ISO 8601 timestamp when the profiler record was created — i.e. when the submission was received. Use as the primary date filter for time-windowed eligibility analysis."},
+        "updated_at": {"type": "TEXT", "description": "ISO 8601 timestamp of the last update to the profiler record."}
+      },
+      "primary_key": "id",
+      "relationships": {
+        "articles": {
+          "join_type": "LEFT",
+          "cardinality": "many_to_one",
+          "keys": [
+            {"local": "jid", "foreign": "jid"},
+            {"local": "aid", "foreign": "aid"}
+          ],
+          "join_strategy": "Join on profiler.jid = articles.jid AND profiler.aid = articles.aid. There is NO declared FK — this is an assumed business-key join. Add profiler.revision = articles.revision when revision-level accuracy is required. A LEFT JOIN from profiler exposes eligible articles that have not yet reached the review stage (no articles row yet exists).",
+          "assumed": true
+        }
+      }
+    }
+  },
+  "metrics": {
+    "completion_rate": {
+      "description": "Percentage of articles where processing is fully complete (is_completed = 1). The primary pipeline throughput metric. Exclude GRC-aborted articles (is_grc_abort = 1) for a meaningful completion rate over articles that stayed in the pipeline. Slice by stage, customer, or jid to compare throughput across segments.",
+      "formula": "COUNT(CASE WHEN is_completed = 1 THEN 1 END) * 100.0 / COUNT(*)",
+      "base_table": "articles",
+      "computability": "direct",
+      "sql_template": "SELECT COUNT(CASE WHEN is_completed = 1 THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0) AS completion_rate_pct FROM articles WHERE (is_grc_abort = 0 OR is_grc_abort IS NULL);",
+      "caveats": [
+        "Exclude is_grc_abort = 1 rows unless the question specifically asks about aborted articles.",
+        "is_completed may be 0 or NULL for in-progress articles — both count as incomplete in the denominator.",
+        "Use NULLIF(COUNT(*), 0) to guard against division by zero on empty result sets."
+      ]
+    },
+    "error_rate": {
+      "description": "Percentage of distinct articles (by jid + aid) that have experienced at least one pipeline error logged in error_logs. Measures overall pipeline reliability. Slice by error_from to identify which pipeline steps fail most often, or by customer/stage to identify systemic issues.",
+      "formula": "COUNT(DISTINCT error_logs.article_id || '|' || error_logs.jid) * 100.0 / COUNT(DISTINCT articles.aid || '|' || articles.jid)",
+      "base_tables": ["articles", "error_logs"],
+      "computability": "direct",
+      "sql_template": "SELECT COUNT(DISTINCT el.article_id || '|' || el.jid) * 100.0 / NULLIF(COUNT(DISTINCT a.aid || '|' || a.jid), 0) AS error_rate_pct FROM articles a LEFT JOIN error_logs el ON el.article_id = a.aid AND el.jid = a.jid;",
+      "caveats": [
+        "Join error_logs to articles on BOTH article_id = aid AND jid = jid — a single-column join causes cross-journal false matches.",
+        "An article in error_logs is not necessarily permanently failed — join to articles.is_completed to split recovered vs stuck articles.",
+        "Group by error_logs.error_from to identify the highest-error pipeline steps."
+      ]
+    },
+    "avg_review_duration_minutes": {
+      "description": "Average IES review duration in minutes, from review_start to review_complete. Measures reviewer throughput and workload. Slice by review_user to compare reviewer speeds, by stage to compare stage complexity, or by customer to compare publisher-specific review loads.",
+      "formula": "AVG((julianday(review_complete) - julianday(review_start)) * 1440)",
+      "base_table": "articles",
+      "computability": "direct",
+      "sql_template": "SELECT AVG((julianday(review_complete) - julianday(review_start)) * 1440) AS avg_review_duration_minutes FROM articles WHERE review_start IS NOT NULL AND review_complete IS NOT NULL AND (is_grc_abort = 0 OR is_grc_abort IS NULL);",
+      "caveats": [
+        "Excludes rows where review_start or review_complete is NULL (article not yet in or through review).",
+        "Exclude is_grc_abort = 1 to avoid skewing the average with aborted articles that may have incomplete or anomalous timestamps.",
+        "Negative or zero durations indicate data quality issues (review_complete recorded before review_start) — filter with review_complete > review_start for clean averages."
+      ]
+    },
+    "support_task_rate": {
+      "description": "Percentage of articles (excluding aborts) that had a support task raised (support_task IS NOT NULL). Measures how often articles require specialist escalation beyond normal IES review. A high support rate may indicate systemic content or format issues.",
+      "formula": "COUNT(CASE WHEN support_task IS NOT NULL THEN 1 END) * 100.0 / COUNT(*)",
+      "base_table": "articles",
+      "computability": "direct",
+      "sql_template": "SELECT COUNT(CASE WHEN support_task IS NOT NULL THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0) AS support_task_rate_pct FROM articles WHERE (is_grc_abort = 0 OR is_grc_abort IS NULL);",
+      "caveats": [
+        "support_task = 'open' means the escalation is still active; 'close' means it was resolved. Distinguish in queries about current vs historical support load.",
+        "Split by support_task = 'open' vs 'close' to see how many escalations remain unresolved."
+      ]
+    },
+    "grc_abort_rate": {
+      "description": "Percentage of articles that were aborted from GRC automated processing (is_grc_abort = 1). Measures how often articles had to be manually pulled from the pipeline. Group by grc_abort_category or grc_abort_reason to identify the most common causes.",
+      "formula": "COUNT(CASE WHEN is_grc_abort = 1 THEN 1 END) * 100.0 / COUNT(*)",
+      "base_table": "articles",
+      "computability": "direct",
+      "sql_template": "SELECT grc_abort_category, COUNT(*) AS aborts, COUNT(*) * 100.0 / NULLIF(SUM(COUNT(*)) OVER (), 0) AS pct_of_aborts FROM articles WHERE is_grc_abort = 1 GROUP BY grc_abort_category ORDER BY aborts DESC;",
+      "caveats": [
+        "grc_abort_category and grc_abort_reason are NULL when is_grc_abort = 0. Always filter is_grc_abort = 1 before grouping on these columns.",
+        "The overall abort rate denominator should include all articles: COUNT(*) with no abort filter."
+      ]
+    },
+    "nimble_error_rate": {
+      "description": "Percentage of articles where the Nimble job ended in error (nimble_status = 'error'), computed over articles where Nimble was invoked (nimble_status IS NOT NULL). High error rates may correlate with specific customers, stages, or file types.",
+      "formula": "COUNT(CASE WHEN nimble_status = 'error' THEN 1 END) * 100.0 / COUNT(CASE WHEN nimble_status IS NOT NULL THEN 1 END)",
+      "base_table": "articles",
+      "computability": "direct",
+      "sql_template": "SELECT COUNT(CASE WHEN nimble_status = 'error' THEN 1 END) * 100.0 / NULLIF(COUNT(CASE WHEN nimble_status IS NOT NULL THEN 1 END), 0) AS nimble_error_rate_pct FROM articles WHERE (is_grc_abort = 0 OR is_grc_abort IS NULL);",
+      "caveats": [
+        "Denominator excludes nimble_status IS NULL (Nimble not yet invoked) to give a rate only over articles that ran through Nimble.",
+        "Join to error_logs WHERE UPPER(error_from) LIKE '%NIMBLE%' for detail on what caused the Nimble failures."
+      ]
+    },
+    "avg_support_duration_minutes": {
+      "description": "Average duration of resolved support tasks in minutes, from support_start to support_complete. Measures specialist response and resolution time. Open support tasks (support_complete IS NULL) are excluded — they represent unresolved cases.",
+      "formula": "AVG((julianday(support_complete) - julianday(support_start)) * 1440)",
+      "base_table": "articles",
+      "computability": "direct",
+      "sql_template": "SELECT AVG((julianday(support_complete) - julianday(support_start)) * 1440) AS avg_support_duration_minutes FROM articles WHERE support_start IS NOT NULL AND support_complete IS NOT NULL;",
+      "caveats": [
+        "Only includes resolved support tasks (support_complete IS NOT NULL). Open tasks are excluded.",
+        "Pair with COUNT(*) WHERE support_task = 'open' AND support_complete IS NULL to report the count of currently open escalations alongside the average resolution time."
+      ]
+    }
+  }
+}

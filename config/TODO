@@ -1,0 +1,25 @@
+Steps: 
+    {
+        [1]: Clean Step: Required {
+            (a) Rename
+            (b) Filter Values
+            (c) Identify Duplicate Rows
+            (d) Create Custom Calculated Field
+        },
+
+        [2]: Join Step: Required {
+            (a) Select Join and Matching Column
+        },
+
+        [3]: Script Step: Optional {
+            Script
+        },
+
+        [4]: Union Step {
+            
+        },
+
+        [5]: Output: Required {
+
+        }
+    }

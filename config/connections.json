@@ -1,0 +1,9 @@
+{
+  "connections": {
+    "articles_sqlite": {
+      "type": "sqlite",
+      "display_name": "Articles Workflow DB",
+      "path": "/home/amit-sharma/windows_drive/SharedStorage/SQL Compilor/articles_workflow.db"
+    }
+  }
+}
