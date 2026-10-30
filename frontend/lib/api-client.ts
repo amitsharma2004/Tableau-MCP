@@ -89,6 +89,12 @@ export const api = {
       actorEmail,
       { method: "POST", body: { sql, limit } }
     ),
+  compileSql: (actorEmail: string, nodeJSON: object) =>
+    request<{ sql: string }>(
+      "/flows/compile-sql",
+      actorEmail,
+      { method: "POST", body: nodeJSON }
+    ),
   uploadFile: async (actorEmail: string, file: File, name?: string) => {
     const formData = new FormData();
     formData.append("file", file);

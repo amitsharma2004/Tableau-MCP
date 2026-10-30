@@ -201,3 +201,63 @@ def execute_flow(flow_id: str, actor: str = Depends(get_actor)):
         return {"ok": True, "hyper": extract, "row_count": hyper_result["row_count"]}
     else:
         return {"ok": False, "error": hyper_result.get("error")}
+
+
+# ── Calcite SQL compilation ───────────────────────────────────────────────────
+
+class CompileSQLBody(BaseModel):
+    dialect: str
+    connection_id: str
+    nodes: list           # sub-graph for Calcite compilation (ancestor nodes only)
+    edges: list
+    flow_id: str | None = None          # when set, auto-save a checkpoint
+    change_summary: str | None = None
+    flow_nodes: list | None = None      # full canvas nodes — used for checkpoint
+    flow_edges: list | None = None      # full canvas edges — used for checkpoint
+
+
+@router.post("/compile-sql")
+def compile_sql(body: CompileSQLBody, actor: str = Depends(get_actor)):
+    """Translate a flow sub-graph JSON into optimized SQL via Apache Calcite.
+
+    nodes/edges  — sub-graph for compilation (ancestor nodes of clicked node).
+    flow_nodes/flow_edges — full canvas graph, saved in the checkpoint so the
+                            checkpoint always reflects the complete flow state.
+    """
+    try:
+        from ...calcite import compile_flow  # noqa: PLC0415
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=f"Calcite module unavailable: {exc}",
+        )
+    try:
+        sql = compile_flow(
+            nodes=body.nodes,
+            edges=body.edges,
+            dialect=body.dialect,
+            connection_id=body.connection_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    checkpoint = None
+    if body.flow_id:
+        flow = crud.get_flow(body.flow_id)
+        if flow:
+            # Use full canvas graph for checkpoint when provided; fall back to sub-graph
+            cp_nodes = body.flow_nodes if body.flow_nodes is not None else body.nodes
+            cp_edges = body.flow_edges if body.flow_edges is not None else body.edges
+            summary = body.change_summary or f"SQL compiled ({len(cp_nodes)} nodes)"
+            checkpoint = crud.save_checkpoint(
+                body.flow_id,
+                cp_nodes,
+                cp_edges,
+                sql,
+                change_summary=summary,
+                created_by=actor,
+            )
+            # Also keep the flow row's sql in sync
+            crud.update_flow_nodes(body.flow_id, cp_nodes, cp_edges, sql)
+
+    return {"sql": sql, "checkpoint": checkpoint}

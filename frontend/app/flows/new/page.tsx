@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import { api, ApiError } from "@/lib/api-client";
 import { useActor } from "@/lib/actor-context";
-import { buildFlowSQL, type FlowSQLResult } from "@/lib/flow-sql";
+import { buildNodeJSONMap, type NodeJSONMap, type FlowNodeJSON } from "@/lib/flow-sql";
 import type { Connection } from "@/lib/types";
 import { VisualFlowCanvas } from "@/components/visual-flow-canvas";
 import TableauDataProfiler from "@/components/tableau-data-profiler";
@@ -96,8 +96,8 @@ function FlowStudioContent() {
   const [isLoadingNodeData, setIsLoadingNodeData] = useState(false);
   const previewDrawerRef = useRef<HTMLDivElement>(null);
 
-  // Per-node SQL map: nodeId → executable SQL up to that node (manual/edited flows)
-  const [nodeSQL, setNodeSQL] = useState<Record<string, string>>({});
+  // Per-node JSON map: nodeId → sub-graph JSON for Calcite SQL compilation
+  const [nodeJSON, setNodeJSON] = useState<NodeJSONMap>({});
 
   // File upload
   const [isUploadingFile, setIsUploadingFile] = useState<boolean>(false);
@@ -221,15 +221,10 @@ function FlowStudioContent() {
     return [];
   }
 
-  // Build { tableName: columnNames[] } from databaseTables for buildFlowSQL
-  function buildColumnMap(): Record<string, string[]> {
-    const map: Record<string, string[]> = {};
-    for (const t of databaseTables) {
-      if (t.name && t.columns?.length) {
-        map[t.name] = t.columns.map((c: any) => c.name as string);
-      }
-    }
-    return map;
+  // Get the dialect for the current connection
+  function getDialect(): string {
+    const conn = connections.find((c) => c.id === selectedConnectionId);
+    return conn?.type ?? "sqlite";
   }
 
   function exportToCsv(rows: Record<string, unknown>[] | null, filename = "export.csv") {
@@ -539,12 +534,12 @@ function FlowStudioContent() {
       return;
     }
 
-    // ── Manual / edited flow: execute per-node SQL from nodeSQL map ──────────
+    // ── Manual / edited flow: compile SQL via Calcite then execute ──────────────
     const nodeKey = (node.alias as string) || (node.id as string) || "";
-    const nodeSQLEntry = nodeSQL[nodeKey] ?? nodeSQL[node.id as string];
+    const nodeJSONEntry: FlowNodeJSON | undefined = nodeJSON[nodeKey] ?? nodeJSON[node.id as string];
 
-    if (node.type === "source" && !nodeSQLEntry) {
-      // Source with no compiled SQL yet → sample raw table
+    // Source node with no JSON yet → sample raw table directly
+    if (node.type === "source" && !nodeJSONEntry) {
       setIsLoadingNodeData(true);
       try {
         const tableName = (node.details?.table as string) || node.label;
@@ -556,11 +551,22 @@ function FlowStudioContent() {
       return;
     }
 
-    if (!nodeSQLEntry) { setNodeDataRows(null); return; }
+    if (!nodeJSONEntry) { setNodeDataRows(null); return; }
 
     setIsLoadingNodeData(true);
     try {
-      const res = await api.queryConnection(actorEmail, connId, nodeSQLEntry, 50);
+      // Step 1: compile sub-graph JSON → SQL via Calcite backend (auto-saves checkpoint)
+      const compiled = await api.compileSql(actorEmail, {
+        ...nodeJSONEntry,
+        flow_id: currentFlow?.flow_id ?? null,
+        change_summary: `Node: ${(node.label as string) || (node.id as string)}`,
+        flow_nodes: nodes,   // full canvas — so checkpoint has complete graph
+        flow_edges: edges,
+      });
+      if (!compiled?.sql) { setNodeDataRows(null); return; }
+      setSql(compiled.sql);
+      // Step 2: execute the compiled SQL against the connection
+      const res = await api.queryConnection(actorEmail, connId, compiled.sql, 50);
       setNodeDataRows(res?.rows?.length ? res.rows : null);
     } catch { setNodeDataRows(null); }
     finally { setIsLoadingNodeData(false); }
@@ -574,13 +580,49 @@ function FlowStudioContent() {
     setError(null);
     try {
       const changeSummary = summary || `Saved (${new Date().toLocaleTimeString()})`;
-      // Persist live flow state
-      await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql });
-      // Save versioned checkpoint
-      await api.saveCheckpoint(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, change_summary: changeSummary });
+      const flowId = currentFlow.flow_id as string;
+      const connId = (currentFlow.connection_id as string) || selectedConnectionId;
+
+      // Find terminal node (last non-output node) and compile fresh SQL so the
+      // checkpoint always reflects the current graph, even if the user never
+      // clicked a node after making changes.
+      const nonOutputNodes = nodes.filter((n) => n.type !== "output");
+      const terminalNode = nonOutputNodes[nonOutputNodes.length - 1];
+      const terminalEntry = terminalNode
+        ? (nodeJSON[terminalNode.id] ?? nodeJSON[(terminalNode as any).alias as string])
+        : undefined;
+
+      let freshSql = sql;
+
+      if (terminalEntry && connId) {
+        try {
+          const compiled = await api.compileSql(actorEmail, {
+            ...terminalEntry,
+            flow_id: flowId,
+            change_summary: changeSummary,
+            flow_nodes: nodes,  // full canvas for checkpoint
+            flow_edges: edges,
+          });
+          if (compiled?.sql) {
+            freshSql = compiled.sql;
+            setSql(freshSql);
+            // compile-sql already persisted checkpoint + updated flow row
+            setHasUnsavedChanges(false);
+            if (isHistoryModalOpen) {
+              const cps = await api.listCheckpoints(actorEmail, flowId);
+              setCheckpoints(cps as unknown as Checkpoint[]);
+            }
+            return;
+          }
+        } catch { /* fall through */ }
+      }
+
+      // Fallback: no nodeJSON entry yet — save with whatever SQL we have
+      await api.updateFlow(actorEmail, flowId, { nodes, edges, sql: freshSql });
+      await api.saveCheckpoint(actorEmail, flowId, { nodes, edges, sql: freshSql, change_summary: changeSummary });
       setHasUnsavedChanges(false);
       if (isHistoryModalOpen) {
-        const cps = await api.listCheckpoints(actorEmail, currentFlow.flow_id as string);
+        const cps = await api.listCheckpoints(actorEmail, flowId);
         setCheckpoints(cps as unknown as Checkpoint[]);
       }
     } catch (err) {
@@ -628,14 +670,15 @@ function FlowStudioContent() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [hasUnsavedChanges, currentFlow, nodes, edges, sql]);
 
-  // ── Auto-build SQL from canvas nodes (manual flows only) ─────────────────
+  // ── Rebuild node JSON map whenever canvas changes (manual flows only) ───────
 
   useEffect(() => {
     if (!canvasEdited.current) return; // skip on initial load — preserves MCP SQL
-    if (nodes.length === 0) { setSql(""); setNodeSQL({}); return; }
-    const result: FlowSQLResult = buildFlowSQL(nodes, edges, buildColumnMap(), 1000);
-    setSql(result.sql);
-    setNodeSQL(result.nodeSQL);
+    if (nodes.length === 0) { setSql(""); setNodeJSON({}); return; }
+    const map = buildNodeJSONMap(nodes, edges, getDialect(), selectedConnectionId);
+    setNodeJSON(map);
+    // sql state is set by the backend after compile; clear stale value on graph change
+    setSql("");
   }, [nodes, edges]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Run flow ──────────────────────────────────────────────────────────────
@@ -1040,16 +1083,27 @@ function FlowStudioContent() {
                             setNodes(updatedNodes);
                             canvasEdited.current = true;
                             setHasUnsavedChanges(true);
-                            // Re-execute join SQL immediately with new type (don't wait for useEffect)
+                            // Immediately rebuild node JSON with new join type and recompile SQL
                             const connId = (currentFlow?.connection_id as string) || selectedConnectionId;
                             if (connId) {
-                              const result = buildFlowSQL(updatedNodes, edges, buildColumnMap(), 1000);
-                              const freshSQL = result.nodeSQL[(selectedNode.alias as string) || (selectedNode.id as string) || ""];
-                              if (freshSQL) {
+                              const freshMap = buildNodeJSONMap(updatedNodes, edges, getDialect(), connId);
+                              const nodeKey = (selectedNode.alias as string) || (selectedNode.id as string) || "";
+                              const freshEntry = freshMap[nodeKey];
+                              if (freshEntry) {
                                 setIsLoadingNodeData(true);
                                 try {
-                                  const res = await api.queryConnection(actorEmail, connId, freshSQL, 50);
-                                  setNodeDataRows(res?.rows?.length ? res.rows : null);
+                                  const compiled = await api.compileSql(actorEmail, {
+                                    ...freshEntry,
+                                    flow_id: currentFlow?.flow_id ?? null,
+                                    change_summary: `Join type changed to ${newType}`,
+                                    flow_nodes: updatedNodes,
+                                    flow_edges: edges,
+                                  });
+                                  if (compiled?.sql) {
+                                    setSql(compiled.sql);
+                                    const res = await api.queryConnection(actorEmail, connId, compiled.sql, 50);
+                                    setNodeDataRows(res?.rows?.length ? res.rows : null);
+                                  }
                                 } catch { setNodeDataRows(null); }
                                 finally { setIsLoadingNodeData(false); }
                               }
