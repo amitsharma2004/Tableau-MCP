@@ -70,6 +70,16 @@ export default function ConnectionsPage() {
     }
   }
 
+  async function handleDelete(id: string) {
+    if (!confirm("Delete this connection?")) return;
+    try {
+      await api.deleteConnection(actorEmail, id);
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to delete connection");
+    }
+  }
+
   async function handleTest(id: string) {
     setTestResults((prev) => ({ ...prev, [id]: "Testing..." }));
     try {
@@ -280,9 +290,17 @@ export default function ConnectionsPage() {
                   </p>
                   {testResults[c.id] && <p className="text-xs text-slate-500 mt-1">{testResults[c.id]}</p>}
                 </div>
-                <button onClick={() => handleTest(c.id)} className="btn-secondary shrink-0">
-                  Test connection
-                </button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button onClick={() => handleTest(c.id)} className="btn-secondary">
+                    Test connection
+                  </button>
+                  <button
+                    onClick={() => handleDelete(c.id)}
+                    className="px-3 py-1.5 text-sm font-medium text-red-600 border border-red-200 rounded-lg hover:bg-red-50 transition-colors"
+                  >
+                    Delete
+                  </button>
+                </div>
               </div>
             ))}
           </div>

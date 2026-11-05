@@ -150,6 +150,10 @@ function FlowStudioContent() {
         setNodes((flow.nodes as BackendNode[]) || []);
         setEdges((flow.edges as BackendEdge[]) || []);
         setSql((flow.sql as string) || "");
+        // Restore persisted per-node SQL map — useEffect will fill any gaps
+        if (flow.node_sql && Object.keys(flow.node_sql).length > 0) {
+          setNodeSQL(flow.node_sql as Record<string, string>);
+        }
         setHasUnsavedChanges(false);
       })
       .catch((err) => setError(`Failed to load flow: ${err instanceof ApiError ? err.message : String(err)}`))
@@ -214,9 +218,47 @@ function FlowStudioContent() {
     const byName = databaseTables.find((t) => t.name.toLowerCase() === alias.toLowerCase());
     if (byName?.columns?.length) return byName.columns.map((c: any) => c.name as string);
 
-    // Trace upstream through edges for transform / clean / join nodes
+    // Trace upstream through edges for transform / clean / join nodes,
+    // applying column-shape changes so downstream nodes see the correct names.
+    const thisNode = nodes.find((n) => n.id === alias);
     const parentEdge = edges.find((e) => e.to === alias);
-    if (parentEdge) return getColumnsForAlias(parentEdge.from, visited);
+    if (parentEdge) {
+      const parentCols = getColumnsForAlias(parentEdge.from, visited);
+
+      if (thisNode?.type === "rename") {
+        const mapping = (thisNode.mappings ?? (thisNode as any).mapping ?? {}) as Record<string, string>;
+        return parentCols.map((c) => mapping[c] ?? c);
+      }
+
+      if (thisNode?.type === "clean") {
+        const operations = ((thisNode as any).operations ?? []) as Array<{ op: string; mapping?: Record<string, string>; name?: string }>;
+        let cols = [...parentCols];
+        for (const op of operations) {
+          if (op.op === "rename" && op.mapping) {
+            cols = cols.map((c) => op.mapping![c] ?? c);
+          } else if (op.op === "calculate" && op.name) {
+            cols = [...cols, op.name];
+          }
+        }
+        return cols;
+      }
+
+      if (thisNode?.type === "aggregate") {
+        const details = (thisNode as any).details ?? thisNode as any;
+        const groupBy = (details.group_by ?? []) as string[];
+        const aggregations = (details.aggregations ?? []) as Array<{ alias: string }>;
+        const out = [...groupBy, ...aggregations.map((a: any) => a.alias)];
+        if (out.length) return out;
+      }
+
+      if (thisNode?.type === "calculate") {
+        const details = (thisNode as any).details ?? thisNode as any;
+        const calculations = (details.calculations ?? []) as Array<{ name: string }>;
+        return [...parentCols, ...calculations.map((c: any) => c.name)];
+      }
+
+      return parentCols;
+    }
 
     return [];
   }
@@ -506,45 +548,12 @@ function FlowStudioContent() {
     const connId = (currentFlow?.connection_id as string) || selectedConnectionId;
     if (!connId) { setNodeDataRows(null); return; }
 
-    const isMcpFlow = !canvasEdited.current;
-
-    // ── MCP-created flow: only output node has runnable SQL ──────────────────
-    if (isMcpFlow) {
-      if (node.type !== "output" && node.type !== "source") {
-        // Internal node — no per-node SQL available from MCP
-        setNodeDataRows([{ __mcp_message: "This flow was created by MCP. Per-node preview is not available. Click the Output node to see final results." }]);
-        return;
-      }
-      // Source node in MCP flow → sample raw table
-      if (node.type === "source") {
-        setIsLoadingNodeData(true);
-        try {
-          const tableName = (node.details?.table as string) || node.label;
-          const schemaName = (node.details?.schema as string) || undefined;
-          const res = await api.sampleTable(actorEmail, connId, tableName, schemaName, 50);
-          setNodeDataRows(res?.rows?.length ? res.rows : null);
-        } catch { setNodeDataRows(null); }
-        finally { setIsLoadingNodeData(false); }
-        return;
-      }
-      // Output node in MCP flow → run the saved flow SQL
-      if (currentFlow?.flow_id) {
-        setIsLoadingNodeData(true);
-        try {
-          const res = await api.runBackendFlow(actorEmail, currentFlow.flow_id as string);
-          setNodeDataRows(res?.rows?.length ? res.rows : null);
-        } catch { setNodeDataRows(null); }
-        finally { setIsLoadingNodeData(false); }
-      }
-      return;
-    }
-
-    // ── Manual / edited flow: execute per-node SQL from nodeSQL map ──────────
+    // ── Resolve per-node SQL from the compiled map (works for all flows) ────
     const nodeKey = (node.alias as string) || (node.id as string) || "";
     const nodeSQLEntry = nodeSQL[nodeKey] ?? nodeSQL[node.id as string];
 
+    // Source node: prefer compiled SQL; fall back to raw table sample
     if (node.type === "source" && !nodeSQLEntry) {
-      // Source with no compiled SQL yet → sample raw table
       setIsLoadingNodeData(true);
       try {
         const tableName = (node.details?.table as string) || node.label;
@@ -556,14 +565,29 @@ function FlowStudioContent() {
       return;
     }
 
-    if (!nodeSQLEntry) { setNodeDataRows(null); return; }
+    // Any node with compiled SQL → run it
+    if (nodeSQLEntry) {
+      setIsLoadingNodeData(true);
+      try {
+        const res = await api.queryConnection(actorEmail, connId, nodeSQLEntry, 50);
+        setNodeDataRows(res?.rows?.length ? res.rows : null);
+      } catch { setNodeDataRows(null); }
+      finally { setIsLoadingNodeData(false); }
+      return;
+    }
 
-    setIsLoadingNodeData(true);
-    try {
-      const res = await api.queryConnection(actorEmail, connId, nodeSQLEntry, 50);
-      setNodeDataRows(res?.rows?.length ? res.rows : null);
-    } catch { setNodeDataRows(null); }
-    finally { setIsLoadingNodeData(false); }
+    // Output node with no compiled SQL (pure MCP flow, nodeSQL not built) → run saved flow SQL
+    if (node.type === "output" && currentFlow?.flow_id) {
+      setIsLoadingNodeData(true);
+      try {
+        const res = await api.runBackendFlow(actorEmail, currentFlow.flow_id as string);
+        setNodeDataRows(res?.rows?.length ? res.rows : null);
+      } catch { setNodeDataRows(null); }
+      finally { setIsLoadingNodeData(false); }
+      return;
+    }
+
+    setNodeDataRows(null);
   }
 
   // ── Save checkpoint ───────────────────────────────────────────────────────
@@ -574,10 +598,10 @@ function FlowStudioContent() {
     setError(null);
     try {
       const changeSummary = summary || `Saved (${new Date().toLocaleTimeString()})`;
-      // Persist live flow state
-      await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql });
+      // Persist live flow state (including per-node SQL map)
+      await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL });
       // Save versioned checkpoint
-      await api.saveCheckpoint(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, change_summary: changeSummary });
+      await api.saveCheckpoint(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL, change_summary: changeSummary });
       setHasUnsavedChanges(false);
       if (isHistoryModalOpen) {
         const cps = await api.listCheckpoints(actorEmail, currentFlow.flow_id as string);
@@ -607,6 +631,9 @@ function FlowStudioContent() {
       setNodes(restored.nodes || []);
       setEdges(restored.edges || []);
       setSql(restored.sql || "");
+      if (restored.node_sql && Object.keys(restored.node_sql).length > 0) {
+        setNodeSQL(restored.node_sql as Record<string, string>);
+      }
       setHasUnsavedChanges(false);
       const cps = await api.listCheckpoints(actorEmail, currentFlow.flow_id as string);
       setCheckpoints(cps as unknown as Checkpoint[]);
@@ -631,11 +658,12 @@ function FlowStudioContent() {
   // ── Auto-build SQL from canvas nodes (manual flows only) ─────────────────
 
   useEffect(() => {
-    if (!canvasEdited.current) return; // skip on initial load — preserves MCP SQL
-    if (nodes.length === 0) { setSql(""); setNodeSQL({}); return; }
+    // Only recompute when user edits canvas — on load, nodeSQL is restored from DB
+    if (!canvasEdited.current) return;
+    if (nodes.length === 0) { setNodeSQL({}); setSql(""); return; }
     const result: FlowSQLResult = buildFlowSQL(nodes, edges, buildColumnMap(), 1000);
-    setSql(result.sql);
     setNodeSQL(result.nodeSQL);
+    setSql(result.sql);
   }, [nodes, edges]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Run flow ──────────────────────────────────────────────────────────────
@@ -648,7 +676,7 @@ function FlowStudioContent() {
     try {
       // Auto-save unsaved changes before running
       if (hasUnsavedChanges) {
-        await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql });
+        await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL });
         setHasUnsavedChanges(false);
       }
       const result = await api.runBackendFlow(actorEmail, currentFlow.flow_id as string);
@@ -683,7 +711,7 @@ function FlowStudioContent() {
     setPublishSuccess(null);
     try {
       if (hasUnsavedChanges) {
-        await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql });
+        await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL });
         setHasUnsavedChanges(false);
       }
       const result = await api.executeBackendFlow(actorEmail, currentFlow.flow_id as string);

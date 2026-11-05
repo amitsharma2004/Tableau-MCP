@@ -37,6 +37,7 @@ def init_db() -> None:
             nodes_json          TEXT NOT NULL,
             edges_json          TEXT NOT NULL,
             source_tables_json  TEXT NOT NULL DEFAULT '[]',
+            node_sql_json       TEXT NOT NULL DEFAULT '{}',
             created_at          TEXT NOT NULL,
             updated_at          TEXT NOT NULL
         );
@@ -48,6 +49,7 @@ def init_db() -> None:
             nodes_json      TEXT NOT NULL,
             edges_json      TEXT NOT NULL,
             sql             TEXT NOT NULL,
+            node_sql_json   TEXT NOT NULL DEFAULT '{}',
             change_summary  TEXT,
             created_at      TEXT NOT NULL,
             created_by      TEXT NOT NULL DEFAULT 'user'
@@ -72,4 +74,9 @@ def init_db() -> None:
             created_at  TEXT NOT NULL
         );
         """)
+        # Migrate existing DBs — add node_sql_json if not present
+        for table in ("flows", "checkpoints"):
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if "node_sql_json" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN node_sql_json TEXT NOT NULL DEFAULT '{{}}'")
     conn.close()
