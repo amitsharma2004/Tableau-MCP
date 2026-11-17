@@ -99,6 +99,17 @@ function FlowStudioContent() {
   // Per-node SQL map: nodeId → executable SQL up to that node (manual/edited flows)
   const [nodeSQL, setNodeSQL] = useState<Record<string, string>>({});
 
+  // Per-node canvas positions: nodeId → {x, y} — persisted in checkpoint
+  const [nodePositions, setNodePositions] = useState<Record<string, { x: number; y: number }>>({});
+
+  function handlePositionsChange(pos: Record<string, { x: number; y: number }>) {
+    setNodePositions(pos);
+    if (currentFlow) setHasUnsavedChanges(true);
+  }
+
+  // Delete confirmation
+  const [pendingDeleteAlias, setPendingDeleteAlias] = useState<string | null>(null);
+
   // File upload
   const [isUploadingFile, setIsUploadingFile] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -153,6 +164,9 @@ function FlowStudioContent() {
         // Restore persisted per-node SQL map — useEffect will fill any gaps
         if (flow.node_sql && Object.keys(flow.node_sql).length > 0) {
           setNodeSQL(flow.node_sql as Record<string, string>);
+        }
+        if (flow.node_positions && Object.keys(flow.node_positions).length > 0) {
+          setNodePositions(flow.node_positions as Record<string, { x: number; y: number }>);
         }
         setHasUnsavedChanges(false);
       })
@@ -598,10 +612,10 @@ function FlowStudioContent() {
     setError(null);
     try {
       const changeSummary = summary || `Saved (${new Date().toLocaleTimeString()})`;
-      // Persist live flow state (including per-node SQL map)
-      await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL });
+      // Persist live flow state (including per-node SQL map and canvas positions)
+      await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL, node_positions: nodePositions });
       // Save versioned checkpoint
-      await api.saveCheckpoint(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL, change_summary: changeSummary });
+      await api.saveCheckpoint(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL, node_positions: nodePositions, change_summary: changeSummary });
       setHasUnsavedChanges(false);
       if (isHistoryModalOpen) {
         const cps = await api.listCheckpoints(actorEmail, currentFlow.flow_id as string);
@@ -633,6 +647,9 @@ function FlowStudioContent() {
       setSql(restored.sql || "");
       if (restored.node_sql && Object.keys(restored.node_sql).length > 0) {
         setNodeSQL(restored.node_sql as Record<string, string>);
+      }
+      if (restored.node_positions && Object.keys(restored.node_positions).length > 0) {
+        setNodePositions(restored.node_positions as Record<string, { x: number; y: number }>);
       }
       setHasUnsavedChanges(false);
       const cps = await api.listCheckpoints(actorEmail, currentFlow.flow_id as string);
@@ -676,7 +693,7 @@ function FlowStudioContent() {
     try {
       // Auto-save unsaved changes before running
       if (hasUnsavedChanges) {
-        await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL });
+        await api.updateFlow(actorEmail, currentFlow.flow_id as string, { nodes, edges, sql, node_sql: nodeSQL, node_positions: nodePositions });
         setHasUnsavedChanges(false);
       }
       const result = await api.runBackendFlow(actorEmail, currentFlow.flow_id as string);
@@ -987,12 +1004,14 @@ function FlowStudioContent() {
             {hasCanvas ? (
               <VisualFlowCanvas
                 backendFlow={backendFlow}
+                nodePositions={nodePositions}
                 onNodeSelect={handleNodeSelect}
                 onTableDrop={(tbl) => handleAddTableToCanvas(tbl)}
                 onConnectNodes={handleConnectNodes}
                 onAddStepOnEdge={handleAddStepOnEdge}
                 onAddStepFromNode={handleAddStepFromNode}
-                onDeleteStep={handleDeleteStep}
+                onDeleteStep={(alias) => setPendingDeleteAlias(alias)}
+                onPositionsChange={handlePositionsChange}
                 className="h-[460px]"
               />
             ) : (
@@ -1235,6 +1254,36 @@ function FlowStudioContent() {
             <div className="px-5 py-3 border-t border-slate-100 bg-slate-50/50 flex justify-end">
               <button onClick={() => setIsHistoryModalOpen(false)} className="px-4 py-1.5 text-xs font-semibold bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg cursor-pointer">
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete node confirmation */}
+      {pendingDeleteAlias && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-sm mx-4 space-y-4">
+            <h2 className="text-base font-semibold text-slate-900">Delete node?</h2>
+            <p className="text-sm text-slate-600">
+              Deleting <span className="font-medium text-slate-800">{pendingDeleteAlias}</span> will
+              disconnect it from the flow. Downstream nodes may need to be reconfigured.
+            </p>
+            <div className="flex justify-end gap-3 pt-1">
+              <button
+                onClick={() => setPendingDeleteAlias(null)}
+                className="px-4 py-2 text-sm font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  handleDeleteStep(pendingDeleteAlias);
+                  setPendingDeleteAlias(null);
+                }}
+                className="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors cursor-pointer"
+              >
+                Delete
               </button>
             </div>
           </div>
