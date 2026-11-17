@@ -72,6 +72,8 @@ export const api = {
   listConnections: (actorEmail: string) => request<Connection[]>("/connections", actorEmail),
   createConnection: (actorEmail: string, payload: ConnectionCreate) =>
     request<Connection>("/connections", actorEmail, { method: "POST", body: payload }),
+  deleteConnection: (actorEmail: string, connectionId: string) =>
+    request<{ deleted: string }>(`/connections/${connectionId}`, actorEmail, { method: "DELETE" }),
   testConnection: (actorEmail: string, connectionId: string) =>
     request<ConnectionTestResult>(`/connections/${connectionId}/test`, actorEmail, { method: "POST" }),
   getConnectionSchema: (actorEmail: string, connectionId: string, forceRefresh: boolean = false) => {
@@ -194,8 +196,8 @@ export const api = {
   getBackendFlow: (actorEmail: string, flowId: string) =>
     request<Record<string, unknown>>(`/flows/${flowId}`, actorEmail),
 
-  /** Save canvas edits (nodes/edges/sql) to the live flow record. */
-  updateFlow: (actorEmail: string, flowId: string, payload: { nodes: unknown[]; edges: unknown[]; sql: string }) =>
+  /** Save canvas edits (nodes/edges/sql/node_sql/node_positions) to the live flow record. */
+  updateFlow: (actorEmail: string, flowId: string, payload: { nodes: unknown[]; edges: unknown[]; sql: string; node_sql?: Record<string, string>; node_positions?: Record<string, { x: number; y: number }> }) =>
     request<Record<string, unknown>>(`/flows/${flowId}`, actorEmail, { method: "PATCH", body: payload }),
 
   runBackendFlow: (actorEmail: string, flowId: string) =>
@@ -211,7 +213,7 @@ export const api = {
   listCheckpoints: (actorEmail: string, flowId: string) =>
     request<Record<string, unknown>[]>(`/flows/${flowId}/checkpoints`, actorEmail),
 
-  saveCheckpoint: (actorEmail: string, flowId: string, payload: { nodes: unknown[]; edges: unknown[]; sql: string; change_summary?: string }) =>
+  saveCheckpoint: (actorEmail: string, flowId: string, payload: { nodes: unknown[]; edges: unknown[]; sql: string; node_sql?: Record<string, string>; node_positions?: Record<string, { x: number; y: number }>; change_summary?: string }) =>
     request<Record<string, unknown>>(`/flows/${flowId}/checkpoints`, actorEmail, { method: "POST", body: payload }),
 
   restoreCheckpoint: (actorEmail: string, flowId: string, cpId: string) =>

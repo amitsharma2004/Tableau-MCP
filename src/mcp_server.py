@@ -48,7 +48,7 @@ from .tools.output_tools import (
     tool_generate_hyper_extract,
 )
 from .store.db import init_db
-from .store.crud import save_flow, save_query_run, save_hyper_extract
+from .store.crud import save_flow, save_query_run, save_hyper_extract, get_flow as crud_get_flow, update_flow_nodes, save_checkpoint, list_flows
 
 # Initialise SQLite store on import so both MCP and API share the same schema
 try:
@@ -157,8 +157,22 @@ def generate_output(
 
     Args:
         connection_id: The selected connection (used for table validation).
-        plan: The flow plan dict with "nodes", "edges", "sql", "connection_id".
-              nodes must include source tables, transformations, and an output node.
+        plan: The flow plan dict. Required fields:
+                "nodes"         – list of node objects (source, transform, output)
+                "edges"         – list of {from, to} dicts
+                "sql"           – final optimized SQL for the full flow
+                "connection_id" – same as the connection_id argument
+              Optional but STRONGLY RECOMMENDED:
+                "node_sql"      – per-node SQL map: {node_id: standalone_sql}
+                                  Generate an optimized SQL for EVERY node in the flow:
+                                  • source node  → "SELECT * FROM <table> LIMIT 1000"
+                                  • each transform (clean/rename/filter/aggregate/calculate/sort/join/union)
+                                    → a WITH clause CTE chain covering all steps up to and including
+                                      that node, ending with "SELECT * FROM <last_cte> LIMIT 1000"
+                                  • output node  → same SQL as the final transform node
+                                  This map powers per-node data preview in the frontend when users
+                                  click individual nodes. Without it, preview falls back to a
+                                  frontend-recomputed CTE that may differ from your optimized query.
         rows: The row list returned by run_query — used for Hyper extract.
         name: Display name for the flow (optional).
         generate_hyper: Set true to also write a .hyper extract file.
@@ -222,6 +236,7 @@ def generate_output(
                 n.get("table") for n in fj.get("nodes", [])
                 if n.get("type") == "source" and n.get("table")
             ],
+            node_sql=plan.get("node_sql") or fj.get("node_sql") or {},
         )
         if rows:
             save_query_run(
@@ -244,6 +259,106 @@ def generate_output(
         result["store_warning"] = f"Could not persist to store: {_store_err}"
 
     return result
+
+
+# ── Tool 6 ─────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_flow(flow_id: str) -> dict:
+    """
+    Read an existing flow by its ID.
+
+    Returns the full flow including nodes, edges, final SQL, and per-node SQL map.
+    Call this before update_flow so you understand the current state of the flow.
+
+    Args:
+        flow_id: The UUID of the flow (shown in the frontend URL as ?flowId=...).
+
+    Returns:
+        {
+          "flow_id": "...",
+          "name": "...",
+          "connection_id": "...",
+          "sql": "final SQL",
+          "node_sql": { "node_id": "standalone SQL for that node", ... },
+          "nodes": [...],
+          "edges": [...],
+          "source_tables": [...]
+        }
+        or {"ok": false, "error": "Flow not found"}
+    """
+    flow = crud_get_flow(flow_id)
+    if not flow:
+        return {"ok": False, "error": f"Flow not found: {flow_id}"}
+    return flow
+
+
+# ── Tool 7 ─────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def update_flow(
+    flow_id: str,
+    plan: dict,
+    change_summary: str = "",
+) -> dict:
+    """
+    Update an existing flow with a revised plan and save a versioned checkpoint.
+
+    Call get_flow first to read the current state, then call this with your changes.
+
+    The plan must contain the complete revised state — not just the diff:
+      "nodes"    – full updated node list
+      "edges"    – full updated edge list
+      "sql"      – final optimized SQL for the updated flow
+      "node_sql" – per-node SQL map for EVERY node (see generate_output for format):
+                   • source node  → "SELECT * FROM <table> LIMIT 1000"
+                   • each transform → WITH CTE chain up to that node + SELECT * LIMIT 1000
+                   • output node  → same as final transform node
+                   This is stored directly in the DB and powers per-node preview without
+                   any recomputation on the frontend.
+
+    Args:
+        flow_id:        The UUID of the flow to update.
+        plan:           Dict with "nodes", "edges", "sql", and "node_sql".
+        change_summary: Short description of what changed (shown in checkpoint history).
+
+    Returns:
+        {
+          "ok": true,
+          "flow": { updated flow object },
+          "frontend_url": "http://localhost:3000/flows/new?flowId=..."
+        }
+        or {"ok": false, "error": "..."}
+    """
+    existing = crud_get_flow(flow_id)
+    if not existing:
+        return {"ok": False, "error": f"Flow not found: {flow_id}"}
+
+    nodes = plan.get("nodes", existing["nodes"])
+    edges = plan.get("edges", existing["edges"])
+    sql = plan.get("sql", existing["sql"])
+    node_sql = plan.get("node_sql") or {}
+
+    try:
+        updated = update_flow_nodes(flow_id, nodes, edges, sql, node_sql)
+        save_checkpoint(
+            flow_id=flow_id,
+            nodes=nodes,
+            edges=edges,
+            sql=sql,
+            node_sql=node_sql,
+            change_summary=change_summary or "Updated by MCP",
+            created_by="mcp",
+        )
+        import os
+        frontend_base = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        return {
+            "ok": True,
+            "flow": updated,
+            "frontend_url": f"{frontend_base}/flows/new?flowId={flow_id}",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 if __name__ == "__main__":

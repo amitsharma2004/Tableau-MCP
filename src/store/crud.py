@@ -28,28 +28,33 @@ def save_flow(
     nodes: list,
     edges: list,
     source_tables: list,
+    node_sql: dict | None = None,
+    node_positions: dict | None = None,
     schema_version: str = "1.0",
 ) -> dict:
     """Insert or replace a flow record. Called by generate_output MCP tool."""
     conn = get_conn()
     now = _now()
+    node_sql_str = json.dumps(node_sql or {})
+    node_pos_str = json.dumps(node_positions or {})
     with conn:
         existing = _row(conn, "flows", "flow_id", flow_id)
         if existing:
             conn.execute(
                 """UPDATE flows SET name=?, sql=?, nodes_json=?, edges_json=?,
-                   source_tables_json=?, updated_at=? WHERE flow_id=?""",
+                   source_tables_json=?, node_sql_json=?, node_positions_json=?, updated_at=? WHERE flow_id=?""",
                 (name, sql, json.dumps(nodes), json.dumps(edges),
-                 json.dumps(source_tables), now, flow_id),
+                 json.dumps(source_tables), node_sql_str, node_pos_str, now, flow_id),
             )
         else:
             conn.execute(
                 """INSERT INTO flows (flow_id, schema_version, name, connection_id,
-                   sql, nodes_json, edges_json, source_tables_json, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                   sql, nodes_json, edges_json, source_tables_json, node_sql_json, node_positions_json,
+                   created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (flow_id, schema_version, name, connection_id,
                  sql, json.dumps(nodes), json.dumps(edges),
-                 json.dumps(source_tables), now, now),
+                 json.dumps(source_tables), node_sql_str, node_pos_str, now, now),
             )
     conn.close()
     return get_flow(flow_id)
@@ -71,12 +76,17 @@ def list_flows() -> list[dict]:
     return [_deserialize_flow(dict(r)) for r in rows]
 
 
-def update_flow_nodes(flow_id: str, nodes: list, edges: list, sql: str) -> dict | None:
+def update_flow_nodes(
+    flow_id: str, nodes: list, edges: list, sql: str,
+    node_sql: dict | None = None, node_positions: dict | None = None,
+) -> dict | None:
     conn = get_conn()
     with conn:
         conn.execute(
-            "UPDATE flows SET nodes_json=?, edges_json=?, sql=?, updated_at=? WHERE flow_id=?",
-            (json.dumps(nodes), json.dumps(edges), sql, _now(), flow_id),
+            """UPDATE flows SET nodes_json=?, edges_json=?, sql=?,
+               node_sql_json=?, node_positions_json=?, updated_at=? WHERE flow_id=?""",
+            (json.dumps(nodes), json.dumps(edges), sql,
+             json.dumps(node_sql or {}), json.dumps(node_positions or {}), _now(), flow_id),
         )
     conn.close()
     return get_flow(flow_id)
@@ -86,6 +96,8 @@ def _deserialize_flow(row: dict) -> dict:
     row["nodes"] = json.loads(row.pop("nodes_json", "[]"))
     row["edges"] = json.loads(row.pop("edges_json", "[]"))
     row["source_tables"] = json.loads(row.pop("source_tables_json", "[]"))
+    row["node_sql"] = json.loads(row.pop("node_sql_json", "{}"))
+    row["node_positions"] = json.loads(row.pop("node_positions_json", "{}"))
     return row
 
 
@@ -96,11 +108,12 @@ def save_checkpoint(
     nodes: list,
     edges: list,
     sql: str,
+    node_sql: dict | None = None,
+    node_positions: dict | None = None,
     change_summary: str | None = None,
     created_by: str = "user",
 ) -> dict:
     conn = get_conn()
-    # next version number
     row = conn.execute(
         "SELECT COALESCE(MAX(version_number), 0) as v FROM checkpoints WHERE flow_id=?",
         (flow_id,),
@@ -111,10 +124,11 @@ def save_checkpoint(
     with conn:
         conn.execute(
             """INSERT INTO checkpoints (id, flow_id, version_number, nodes_json,
-               edges_json, sql, change_summary, created_at, created_by)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               edges_json, sql, node_sql_json, node_positions_json, change_summary, created_at, created_by)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (cp_id, flow_id, version, json.dumps(nodes), json.dumps(edges),
-             sql, change_summary, now, created_by),
+             sql, json.dumps(node_sql or {}), json.dumps(node_positions or {}),
+             change_summary, now, created_by),
         )
     conn.close()
     return get_checkpoint(cp_id)
@@ -144,9 +158,14 @@ def restore_checkpoint(flow_id: str, cp_id: str) -> dict | None:
     cp = get_checkpoint(cp_id)
     if not cp:
         return None
-    update_flow_nodes(flow_id, cp["nodes"], cp["edges"], cp["sql"])
+    update_flow_nodes(
+        flow_id, cp["nodes"], cp["edges"], cp["sql"],
+        node_sql=cp.get("node_sql"), node_positions=cp.get("node_positions"),
+    )
     save_checkpoint(
         flow_id, cp["nodes"], cp["edges"], cp["sql"],
+        node_sql=cp.get("node_sql"),
+        node_positions=cp.get("node_positions"),
         change_summary=f"Restored from checkpoint v{cp['version_number']}",
     )
     return get_flow(flow_id)
@@ -155,6 +174,8 @@ def restore_checkpoint(flow_id: str, cp_id: str) -> dict | None:
 def _deserialize_checkpoint(row: dict) -> dict:
     row["nodes"] = json.loads(row.pop("nodes_json", "[]"))
     row["edges"] = json.loads(row.pop("edges_json", "[]"))
+    row["node_sql"] = json.loads(row.pop("node_sql_json", "{}"))
+    row["node_positions"] = json.loads(row.pop("node_positions_json", "{}"))
     return row
 
 

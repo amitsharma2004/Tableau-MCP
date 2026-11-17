@@ -15,7 +15,7 @@ from ..deps import get_actor
 router = APIRouter(prefix="/flows", tags=["flows"])
 
 
-# ── Request bodies ───────────────────────────────────────────────────────────
+# ── Request bodies ────────────*=*=*────────-+-+-+-+-───────────────────────────────────
 
 class CreateFlowBody(BaseModel):
     name: str
@@ -25,12 +25,16 @@ class PatchFlowBody(BaseModel):
     nodes: list
     edges: list
     sql: str
+    node_sql: dict = {}
+    node_positions: dict = {}
 
 
 class CheckpointBody(BaseModel):
     nodes: list
     edges: list
     sql: str
+    node_sql: dict = {}
+    node_positions: dict = {}
     change_summary: str | None = None
 
 
@@ -71,7 +75,7 @@ def update_flow(flow_id: str, body: PatchFlowBody, actor: str = Depends(get_acto
     flow = crud.get_flow(flow_id)
     if not flow:
         raise HTTPException(status_code=404, detail="Flow not found")
-    updated = crud.update_flow_nodes(flow_id, body.nodes, body.edges, body.sql)
+    updated = crud.update_flow_nodes(flow_id, body.nodes, body.edges, body.sql, body.node_sql, body.node_positions)
     return updated
 
 
@@ -93,6 +97,8 @@ def save_checkpoint(flow_id: str, body: CheckpointBody, actor: str = Depends(get
         body.nodes,
         body.edges,
         body.sql,
+        node_sql=body.node_sql,
+        node_positions=body.node_positions,
         change_summary=body.change_summary,
         created_by=actor,
     )

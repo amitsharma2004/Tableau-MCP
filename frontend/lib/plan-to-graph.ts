@@ -33,7 +33,10 @@ export interface BackendFlow {
 
 // ── Adapter: backend nodes/edges → React Flow graph ─────────────────────────
 
-export function backendFlowToGraph(flow: BackendFlow): { nodes: Node<PrepNodeData>[]; edges: Edge[] } {
+export function backendFlowToGraph(
+  flow: BackendFlow,
+  savedPositions?: Record<string, { x: number; y: number }>,
+): { nodes: Node<PrepNodeData>[]; edges: Edge[] } {
   const rfNodes: Node<PrepNodeData>[] = [];
   const rfEdges: Edge[] = [];
 
@@ -80,7 +83,7 @@ export function backendFlowToGraph(flow: BackendFlow): { nodes: Node<PrepNodeDat
   flow.nodes.forEach((n) => {
     if (n.type === "output") return; // rendered via output node below
 
-    const pos = posMap[n.id] ?? { x: startX, y: startY };
+    const pos = savedPositions?.[n.id] ?? posMap[n.id] ?? { x: startX, y: startY };
     const style = STEP_COLORS[n.type] ?? STEP_COLORS.filter;
 
     let label = n.type === "source" ? (n.table ?? n.id) : n.id;
@@ -121,10 +124,11 @@ export function backendFlowToGraph(flow: BackendFlow): { nodes: Node<PrepNodeDat
     const parentId = outputNode.input ?? flow.nodes[flow.nodes.length - 2]?.id;
     const parentPos = posMap[parentId ?? ""] ?? { x: startX, y: startY };
     const depth = (depthMap[parentId ?? ""] ?? 0) + 1;
+    const outputPos = savedPositions?.[outputNode.id] ?? { x: startX + depth * colWidth, y: parentPos.y };
     rfNodes.push({
       id: outputNode.id,
       type: "prepStep",
-      position: { x: startX + depth * colWidth, y: parentPos.y },
+      position: outputPos,
       data: {
         label: outputNode.name ?? "Tableau Extract",
         type: "output",
